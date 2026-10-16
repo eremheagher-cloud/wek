@@ -1,0 +1,390 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Instance Number (1-10)"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: System Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "=== PC VIRTUAL ===" -ForegroundColor Green
+          Write-Host "Instancia: ${{ inputs.instance_number }}"
+
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion
+
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP habilitado."
+
+      - name: Create User Account
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $userName = 'Rafael'
+
+          # GERADOR AUTOMATICO DE SENHA
+          # Mantido no codigo completo.
+          $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+          $lower = 'abcdefghijkmnopqrstuvwxyz'
+          $digits = '23456789'
+          $symbols = '!@#$%*-_+'
+          $all = $upper + $lower + $digits + $symbols
+
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $script:rng = $rng
+
+          function Get-SecureRandomIndex {
+            param([int]$Max)
+
+            $buffer = New-Object byte[] 4
+            $script:rng.GetBytes($buffer)
+            $number = [BitConverter]::ToUInt32($buffer, 0)
+
+            return [int]($number % $Max)
+          }
+
+          $chars = @(
+            [string]$upper[(Get-SecureRandomIndex $upper.Length)]
+            [string]$lower[(Get-SecureRandomIndex $lower.Length)]
+            [string]$digits[(Get-SecureRandomIndex $digits.Length)]
+            [string]$symbols[(Get-SecureRandomIndex $symbols.Length)]
+          )
+
+          for ($i = 0; $i -lt 20; $i++) {
+            $chars += [string]$all[(Get-SecureRandomIndex $all.Length)]
+          }
+
+          # Embaralha os caracteres usando o gerador criptografico.
+          for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = Get-SecureRandomIndex ($i + 1)
+            $temp = $chars[$i]
+            $chars[$i] = $chars[$j]
+            $chars[$j] = $temp
+          }
+
+          $passwordText = -join $chars
+
+          $rng.Dispose()
+          Remove-Variable rng -Scope Script -ErrorAction SilentlyContinue
+
+          $securePassword = ConvertTo-SecureString `
+            $passwordText `
+            -AsPlainText `
+            -Force
+
+          $user = Get-LocalUser `
+            -Name $userName `
+            -ErrorAction SilentlyContinue
+
+          if ($user) {
+            Set-LocalUser `
+              -Name $userName `
+              -Password $securePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $userName `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group 'Administrators' `
+            -Member $userName `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group 'Remote Desktop Users' `
+            -Member $userName `
+            -ErrorAction SilentlyContinue
+
+          "RDP_USERNAME=$userName" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          "RDP_PASSWORD=$passwordText" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Conta: $userName"
+          Write-Host "Senha gerada automaticamente."
+          Write-Host "O gerador de senha foi mantido."
+
+      - name: Prepare Tailscale Dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          foreach ($serviceName in @(
+            'Dnscache',
+            'iphlpsvc',
+            'netprofm',
+            'WinHttpAutoProxySvc'
+          )) {
+            $service = Get-Service `
+              -Name $serviceName `
+              -ErrorAction SilentlyContinue
+
+            if ($service -and $service.Status -ne 'Running') {
+              if ($service.StartType -eq 'Disabled') {
+                Set-Service `
+                  -Name $serviceName `
+                  -StartupType Automatic
+              }
+
+              Start-Service `
+                -Name $serviceName `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Instalador oficial estavel do Tailscale.
+          # URL corrigida para evitar o erro 404.
+          $installerPath = Join-Path $env:TEMP 'tailscale-setup.exe'
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.104.1.exe'
+
+          Write-Host "Baixando instalador do Tailscale..."
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath `
+            -UseBasicParsing
+
+          if (-not (Test-Path $installerPath)) {
+            throw "O instalador do Tailscale nao foi baixado."
+          }
+
+          $file = Get-Item $installerPath
+
+          if ($file.Length -lt 1MB) {
+            throw "O arquivo baixado parece invalido."
+          }
+
+          $signature = Get-AuthenticodeSignature $installerPath
+
+          if ($signature.Status -ne 'Valid') {
+            throw "A assinatura digital do instalador nao e valida."
+          }
+
+          $installProcess = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList '/quiet' `
+            -Wait `
+            -PassThru
+
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+          if ($installProcess.ExitCode -ne 0) {
+            throw "Falha na instalacao do Tailscale. Codigo: $($installProcess.ExitCode)"
+          }
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "Executavel do Tailscale nao encontrado."
+          }
+
+          & $tailscaleExe version
+
+      - name: Start Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host "=== INICIANDO TAILSCALE ===" -ForegroundColor Green
+
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "O Tailscale nao esta instalado."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Configure o secret TAILSCALE_AUTH_KEY nas configuracoes do repositorio."
+          }
+
+          $service = Get-Service `
+            -Name Tailscale `
+            -ErrorAction SilentlyContinue
+
+          if (-not $service) {
+            throw "Servico do Tailscale nao encontrado."
+          }
+
+          if ($service.Status -ne 'Running') {
+            Start-Service -Name Tailscale
+            Start-Sleep -Seconds 5
+          }
+
+          & $tailscaleExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=pc-criado-alves7-pcm" `
+            "--accept-dns=false" `
+            "--timeout=120s"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha na autenticacao do Tailscale. Verifique a Auth Key."
+          }
+
+          $tsIP = (
+            & $tailscaleExe ip -4 |
+            Select-Object -First 1
+          ).ToString().Trim()
+
+          if ($tsIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+            throw "Nao foi possivel obter o IP do Tailscale."
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale conectado: $tsIP"
+
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installerPath = Join-Path $env:TEMP 'chrome_installer.exe'
+
+          try {
+            Invoke-WebRequest `
+              -Uri 'https://dl.google.com/chrome/install/latest/chrome_installer.exe' `
+              -OutFile $installerPath `
+              -UseBasicParsing
+
+            $process = Start-Process `
+              -FilePath $installerPath `
+              -ArgumentList '/silent', '/install' `
+              -Wait `
+              -PassThru
+
+            if ($process.ExitCode -ne 0) {
+              Write-Warning "A instalacao do Chrome retornou o codigo $($process.ExitCode)."
+            }
+            else {
+              Write-Host "Chrome instalado."
+            }
+          }
+          catch {
+            Write-Warning "Nao foi possivel instalar o Chrome: $($_.Exception.Message)"
+          }
+          finally {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Connection Details
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host ""
+          Write-Host "========================================" -ForegroundColor Green
+          Write-Host "       DADOS DO PC VIRTUAL RDP" -ForegroundColor Green
+          Write-Host "========================================" -ForegroundColor Green
+
+          Write-Host "Instancia: ${{ inputs.instance_number }}"
+          Write-Host "Host/IP: $env:TAILSCALE_IP"
+          Write-Host "Usuario: $env:RDP_USERNAME"
+          Write-Host "Senha: $env:RDP_PASSWORD"
+
+          Write-Host "========================================" -ForegroundColor Green
+          Write-Host "Conecte o dispositivo cliente ao Tailscale."
+          Write-Host "Depois, conecte ao IP acima pelo aplicativo RDP."
+          Write-Host "========================================" -ForegroundColor Green
+
+      - name: Keep Session Alive
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $counter = 0
+
+          while ($true) {
+            $counter++
+
+            Write-Host ""
+            Write-Host "Verificacao #$counter - $(Get-Date)"
+
+            try {
+              $tsIP = (
+                & $tailscaleExe ip -4 2>$null |
+                Select-Object -First 1
+              )
+
+              if ($tsIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+                Write-Warning "Tailscale desconectado. Tentando reconectar..."
+
+                & $tailscaleExe up `
+                  "--authkey=$env:TAILSCALE_AUTH_KEY" `
+                  "--hostname=pc-criado-alves7-pcm" `
+                  "--accept-dns=false" `
+                  "--timeout=120s"
+
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Warning "Reconexao falhou. Tentara novamente."
+                }
+                else {
+                  Write-Host "Tailscale reconectado."
+                }
+              }
+              else {
+                Write-Host "Tailscale IP: $tsIP"
+              }
+            }
+            catch {
+              Write-Warning "Erro na verificacao: $($_.Exception.Message)"
+            }
+
+            Start-Sleep -Seconds 60
+          }
